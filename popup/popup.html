@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<!--
+  popup/popup.html
+
+  The small window that opens when you click the Ad-Blocker icon in the toolbar.
+  This file is only the layout. popup.js fills in the text and handles the switch,
+  and popup.css makes it look nice.
+
+  Chrome extensions do not allow scripts written inside the HTML page (no inline
+  scripts), so the scripts are loaded from files. The order matters:
+  lib/sites.js first (it defines the helper functions), then popup.js (which uses them).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Ad-Blocker</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="title-row">
+    <img src="../icons/icon48.png" width="48" height="48" alt="">
+    <h1>Ad-Blocker</h1>
+  </header>
+
+  <!-- The site of the tab you are looking at. popup.js writes it. -->
+  <p id="site-name" class="site-name">Loading...</p>
+
+  <!-- The switch is a real checkbox (so keyboards and screen readers work),
+       and popup.css draws it as a toggle. Checked means blocking is on. -->
+  <div class="switch-row">
+    <input type="checkbox" id="block-switch" class="switch" checked disabled>
+    <label for="block-switch">Blocking on this site</label>
+  </div>
+
+  <!-- A short message under the switch, for example when a page cannot be blocked. -->
+  <p id="note" class="note" hidden></p>
+
+  <p id="blocked-line" class="line">Blocked on this page: 0</p>
+
+  <p id="rules-line" class="line">Rules from ...</p>
+  <p id="rules-hint" class="hint"></p>
+
+  <footer class="footer">Nothing you browse leaves this computer.</footer>
+
+  <script src="../lib/sites.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
