@@ -2,8 +2,9 @@
 
 Run from the repo root:
   python3 -m unittest discover -s tests -v
-To include the checks on the real lists (they are skipped when the lists are absent):
-  ADBLOCK_LISTS=workspace/lists python3 -m unittest tests.test_convert -v
+The checks on the real lists read them from lists/ (or the folder named in the
+ADBLOCK_LISTS environment variable) and are skipped when the lists are absent:
+  ADBLOCK_LISTS=path/to/lists python3 -m unittest tests.test_convert -v
 
 Only the Python standard library is used. Nothing here touches the internet:
 the one test that looks at downloading replaces the network call with a stand-in.
