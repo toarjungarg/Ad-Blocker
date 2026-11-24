@@ -1,0 +1,27 @@
+{
+  "generic": [
+    "div[id^=\"google_ads_iframe\"]",
+    "div[id^=\"div-gpt-ad\"]",
+    "ins.adsbygoogle",
+    "iframe[id^=\"google_ads_iframe\"]",
+    "iframe[src*=\"doubleclick.net\"]",
+    "iframe[src*=\"googlesyndication.com\"]",
+    "iframe[src*=\"amazon-adsystem.com\"]",
+    "a[href*=\"doubleclick.net/\"]",
+    "a[href*=\"googleadservices.com/\"]",
+    "[id^=\"taboola-\"]",
+    "[id^=\"outbrain_widget\"]",
+    ".OUTBRAIN",
+    ".trc_related_container",
+    ".ad-banner",
+    ".ad-container",
+    ".ad-wrapper",
+    ".adsbox",
+    ".advertisement",
+    ".sponsored-ad",
+    ".banner-ads",
+    "#ad-slot",
+    "#ad-banner",
+    "#advertisement"
+  ]
+}
