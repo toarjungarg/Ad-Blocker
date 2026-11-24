@@ -529,6 +529,38 @@ def build_network_rules(lists, max_rules=None):
 
 # ---------------------------------------------------------------- hide lines
 
+def is_balanced_selector(selector):
+    """True when every bracket and quote in the selector is closed properly.
+
+    A selector like "div[bad" would make the browser read on into the next CSS
+    rules and lose them, so such selectors are skipped here and never reach
+    hide.json. Same walk as isBalancedSelector in background.js:
+    quotes (' and ") hide everything inside them, a backslash escapes the next
+    character, and [ ( must be closed by the matching ] ).
+    """
+    stack = []
+    quote = None  # the quote character we are inside, or None
+    i = 0
+    while i < len(selector):
+        ch = selector[i]
+        if ch == "\\":
+            i += 2  # skip the escaped character
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch in "[(":
+            stack.append(ch)
+        elif ch in "])":
+            opener = stack.pop() if stack else None
+            if (ch == "]" and opener != "[") or (ch == ")" and opener != "("):
+                return False
+        i += 1
+    return quote is None and not stack
+
+
 def parse_hide_line(line):
     """Parse one cosmetic line (## or #@# and friends).
 
@@ -560,6 +592,8 @@ def parse_hide_line(line):
             return None, "hide: unsafe characters in selector"
     if selector.startswith("@"):
         return None, "hide: unsafe characters in selector"
+    if not is_balanced_selector(selector):
+        return None, "hide: unbalanced selector"
 
     include = []
     exclude = []
