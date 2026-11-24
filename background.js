@@ -4,15 +4,19 @@
 // it is needed and stops it when it is idle, so it must not keep state in
 // variables that it cannot rebuild.
 //
-// What it does (first version):
+// What it does:
 //   1. Turns on the blocked-count number on the toolbar icon.
 //   2. Loads the converted EasyList rules from rules/network.json (if that file
 //      exists) as dynamic rules, in chunks. Without the file, only the small
 //      built-in list (base-rules.json) is used.
 //   3. Keeps one extra "allowlist" rule up to date, so sites the user turned
 //      blocking off for are left alone.
-//
-// Hiding ads with CSS comes in a later version.
+//   4. Hides ad boxes that are still on the page after the network rules did
+//      their work. content.js sends a "hide" message when a page (or a frame
+//      inside it) starts loading. This file answers by injecting a stylesheet
+//      with "display:none" rules into that page, unless the site is on the
+//      allowlist. The selectors come from rules/hide.json (made by
+//      tools/convert.py) plus the small built-in list in base-hide.json.
 //
 // Why dynamic rules for the converted lists? A rule file named in manifest.json
 // must exist or Chrome will not load the extension, and rules/ is not in the
@@ -45,10 +49,11 @@ const MAX_RULE_WARNINGS = 20;
 const NETWORK_RULES_PATH = "rules/network.json";
 const ALLOWLIST_STORAGE_KEY = "allowlist";
 
-// Used by the hiding code that is added later. Kept here so every setting
-// is in one place.
+// Settings for hiding ads with CSS. Kept here so every setting is in one place.
 const HIDE_CSS = "{display:none!important}"; // what each hidden element gets
 const MAX_CSS_CACHE = 200;                    // most hostnames whose CSS we remember
+const HIDE_RULES_PATH = "rules/hide.json";    // made by tools/convert.py (may be missing)
+const BASE_HIDE_PATH = "base-hide.json";      // small built-in list, always used
 
 // ------------------------------------------------------------- load helpers
 
@@ -233,6 +238,231 @@ async function rebuildAllowlistRule() {
   });
 }
 
+// ------------------------------------------------------------- hiding ads (CSS)
+
+// Reads one JSON file from inside the extension. A missing or broken file gives
+// null, because "the file is not there yet" is a normal state.
+async function readExtensionJson(path) {
+  try {
+    const response = await fetch(chrome.runtime.getURL(path));
+    if (!response.ok) return null;
+    return await response.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+// True for a normal object like {"a": 1} (not null, not a list).
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// Looks up a key in an object, but only if the object really owns it. This stops
+// a hostname like "constructor" from finding something built into JavaScript.
+function ownValue(object, key) {
+  if (!isPlainObject(object)) return undefined;
+  return Object.prototype.hasOwnProperty.call(object, key) ? object[key] : undefined;
+}
+
+// Checks that every bracket and quote in a selector is closed properly.
+// "div[bad" has a "[" that never closes. A browser reads CSS in one stream, so
+// an open bracket or quote does not stop at the end of the line: it keeps going
+// into the next rules and swallows them. So selectors like that must never reach
+// the stylesheet. This walks the text once:
+//   - inside a quote (' or "), only the closing quote matters;
+//   - a backslash escapes the next character (so \" is not a quote);
+//   - "[" and "(" go on a stack, and "]" and ")" must match the top of it.
+// Returns true when everything is closed and nothing is mismatched.
+function isBalancedSelector(selector) {
+  const stack = [];
+  let quote = null; // the quote character we are inside, or null
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (ch === "\\") {
+      i++; // skip the escaped character
+      continue;
+    }
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "[" || ch === "(") {
+      stack.push(ch);
+    } else if (ch === "]" || ch === ")") {
+      const open = stack.pop();
+      if ((ch === "]" && open !== "[") || (ch === ")" && open !== "(")) return false;
+    }
+  }
+  return quote === null && stack.length === 0;
+}
+
+// Cleans a list of selectors: keeps only text, drops empty ones and duplicates.
+// A selector with "{", "}" or a line break could break out of its own CSS rule,
+// so those are dropped too. Real selectors never contain them. Selectors with
+// an unclosed bracket or quote are dropped as well (see isBalancedSelector).
+function cleanSelectors(list) {
+  const seen = new Set();
+  const result = [];
+  if (!Array.isArray(list)) return result;
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const selector = item.trim();
+    if (selector === "" || /[{}\n\r]/.test(selector)) continue;
+    if (!isBalancedSelector(selector)) continue;
+    if (seen.has(selector)) continue;
+    seen.add(selector);
+    result.push(selector);
+  }
+  return result;
+}
+
+// Turns selectors into CSS text, ONE RULE PER SELECTOR.
+// Why not one big rule like "a, b, c {display:none}"? In CSS, if any single
+// selector in a comma list is invalid, the browser throws away the whole rule.
+// One bad selector out of 13,000 would then switch off all the others. With one
+// rule each, an invalid selector only cancels its own line.
+// One kind of bad selector is different: an unclosed bracket or quote makes the
+// browser read on into the next rules. cleanSelectors removes those before this
+// function ever sees them, so every line here is safe on its own.
+function selectorsToCss(selectors) {
+  return selectors.map((selector) => selector + HIDE_CSS).join("\n");
+}
+
+// The hide data, loaded once per worker life. The promise is cached, so the two
+// files are read and the big generic CSS string is built only the first time a
+// page asks. After that every page reuses the same string. If the worker is
+// stopped and started again, this is simply rebuilt.
+// Shape: { generic: [selectors], genericCss: "text", sites: {...}, siteExceptions: {...} }
+let hideDataPromise = null;
+
+function getHideData() {
+  if (!hideDataPromise) hideDataPromise = loadHideData();
+  return hideDataPromise;
+}
+
+async function loadHideData() {
+  const base = await readExtensionJson(BASE_HIDE_PATH);
+  const converted = await readExtensionJson(HIDE_RULES_PATH);
+
+  // base-hide.json is always merged in, so a few common ad boxes are hidden
+  // even before tools/convert.py has been run. cleanSelectors removes duplicates.
+  const generic = cleanSelectors(
+    [].concat(
+      isPlainObject(base) && Array.isArray(base.generic) ? base.generic : [],
+      isPlainObject(converted) && Array.isArray(converted.generic) ? converted.generic : []
+    )
+  );
+
+  return {
+    generic,
+    genericCss: selectorsToCss(generic),
+    sites: isPlainObject(converted) && isPlainObject(converted.sites) ? converted.sites : {},
+    siteExceptions:
+      isPlainObject(converted) && isPlainObject(converted.siteExceptions)
+        ? converted.siteExceptions
+        : {},
+  };
+}
+
+// Gathers the selectors a table has for a hostname and for each parent domain
+// (a.b.example.com, b.example.com, example.com).
+function collectForHost(table, hostname) {
+  let all = [];
+  for (const domain of parentDomains(hostname)) {
+    const list = ownValue(table, domain);
+    if (Array.isArray(list)) all = all.concat(list);
+  }
+  return cleanSelectors(all);
+}
+
+// Generic CSS with some selectors left out, remembered per hostname.
+// A Map remembers the order things were added, so the first key is the oldest.
+// When the Map is full we delete the oldest one, which keeps memory small.
+const filteredCssCache = new Map();
+
+function filteredGenericCss(data, hostname, exceptions) {
+  if (filteredCssCache.has(hostname)) return filteredCssCache.get(hostname);
+  const css = selectorsToCss(data.generic.filter((selector) => !exceptions.has(selector)));
+  if (filteredCssCache.size >= MAX_CSS_CACHE) {
+    filteredCssCache.delete(filteredCssCache.keys().next().value);
+  }
+  filteredCssCache.set(hostname, css);
+  return css;
+}
+
+// Builds the full stylesheet text for one hostname:
+//   generic selectors (minus this site's exceptions) + this site's own selectors.
+// Sites without exceptions (almost all of them) just reuse the generic string
+// that was built once.
+async function getCssForHostname(hostname) {
+  const data = await getHideData();
+
+  const exceptions = new Set(collectForHost(data.siteExceptions, hostname));
+  const genericCss =
+    exceptions.size > 0 ? filteredGenericCss(data, hostname, exceptions) : data.genericCss;
+
+  const siteSelectors = collectForHost(data.sites, hostname).filter(
+    (selector) => !exceptions.has(selector)
+  );
+
+  const parts = [genericCss];
+  if (siteSelectors.length > 0) parts.push(selectorsToCss(siteSelectors));
+  return parts.filter((part) => part !== "").join("\n");
+}
+
+// Returns the hostname of an http or https address (like "www.cnn.com"), or null.
+// Unlike siteFromUrl it keeps the "www.", so lookups use the exact host.
+function httpHostname(url) {
+  if (typeof url !== "string") return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.hostname ? parsed.hostname.toLowerCase() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Handles one "hide" message from content.js. Any problem is ignored on purpose:
+// the page may have closed, or the tab may be a page we are not allowed to touch.
+async function handleHideMessage(sender) {
+  try {
+    if (!sender || !sender.tab || typeof sender.tab.id !== "number") return;
+    const frameId = typeof sender.frameId === "number" ? sender.frameId : 0;
+
+    // Which page is this? The top page decides about the allowlist, so a frame
+    // inside an allowlisted page is left alone too. Not http/https: do nothing.
+    const pageUrl = frameId === 0 ? sender.url : sender.tab.url;
+    const pageSite = siteFromUrl(pageUrl);
+    if (pageSite === null) return;
+
+    // Read the allowlist fresh each time (reading storage is cheap), because
+    // the worker can be stopped and started and must not rely on old copies.
+    const data = await chrome.storage.local.get(ALLOWLIST_STORAGE_KEY);
+    if (isAllowlisted(pageSite, data[ALLOWLIST_STORAGE_KEY])) return;
+
+    // Site-specific selectors use the frame's own host (an ad frame has its own
+    // address). If the frame has no web address (like about:blank), use the page's.
+    const hostname = httpHostname(sender.url) || httpHostname(pageUrl);
+    if (!hostname) return;
+
+    const css = await getCssForHostname(hostname);
+    if (css === "") return;
+
+    // origin "USER" puts the CSS in the user style layer. Page styles cannot
+    // override it, even if the page uses its own "!important" rules.
+    await chrome.scripting.insertCSS({
+      target: { tabId: sender.tab.id, frameIds: [frameId] },
+      css,
+      origin: "USER",
+    });
+  } catch (e) {
+    // Ignored on purpose (see above).
+  }
+}
+
 // ------------------------------------------------------------- events
 
 // Everything here is wrapped in try/catch so the worker never throws while it
@@ -264,6 +494,12 @@ try {
     queueRuleWork(rebuildAllowlistRule).catch((e) => {
       console.warn("Ad-Blocker: could not update the allowlist rule", e);
     });
+  });
+
+  // content.js asks for hiding CSS when a page or frame starts loading.
+  // Returning nothing (not true) tells Chrome we send no reply.
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (message && message.type === "hide") handleHideMessage(sender);
   });
 } catch (e) {
   console.warn("Ad-Blocker: could not start", e);
