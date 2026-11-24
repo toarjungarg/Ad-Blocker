@@ -493,6 +493,40 @@ class HideLineTests(unittest.TestCase):
                 self.assertEqual(hide, {"generic": [], "sites": {}, "siteExceptions": {}})
                 self.assertEqual(sum(report["hide_skips"].values()), 1)
 
+    def test_unbalanced_selectors_are_skipped_with_their_own_reason(self):
+        # An unclosed bracket or quote would swallow the CSS rules after it.
+        lines = [
+            "##div[bad",
+            "##p(x",
+            "##.q\"x",
+            "##a[href='x]",
+            "##a[href=\"x']",
+            "##div]",
+            "##div)",
+            "##a[x(]",
+            "##a(x[)]",
+            "a.com##div[bad",
+            "~a.com##div[bad",
+            "a.com#@#div[bad",
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                rules, hide, meta, report = convert_text([line])
+                self.assertEqual(hide, {"generic": [], "sites": {}, "siteExceptions": {}})
+                self.assertEqual(report["hide_skips"], {"hide: unbalanced selector": 1})
+                self.assertEqual(meta["skipped"], 1)
+
+    def test_balanced_selectors_with_quotes_and_escapes_are_kept(self):
+        good = [
+            "a[href*=\"x]y\"]",              # a bracket inside a string does not count
+            "a[onclick^=\"w('https://x/')\"]",
+            "div:not(.a):has(> img[alt=\"]\"])",
+            "a[title='it\\'s']",             # escaped quote inside a string
+            ".a\\[b\\]",                     # escaped brackets in a class name
+        ]
+        hide = hide_for(["##" + selector for selector in good])
+        self.assertEqual(sorted(hide["generic"]), sorted(good))
+
     def test_duplicates_removed(self):
         hide = hide_for(["##.ad", "##.ad", "a.com##.x", "a.com##.x"])
         self.assertEqual(hide["generic"], [".ad"])

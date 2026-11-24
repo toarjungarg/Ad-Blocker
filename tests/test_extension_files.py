@@ -133,13 +133,21 @@ class ManifestTests(unittest.TestCase):
         text = json.dumps(self.manifest)
         self.assertNotIn("rules/", text)
 
-    def test_content_scripts_if_present(self):
-        for script in self.manifest.get("content_scripts", []):
-            self.assertEqual(script.get("matches"), ["<all_urls>"])
-            self.assertEqual(script.get("run_at"), "document_start")
-            self.assertIs(script.get("all_frames"), True)
-            for name in script.get("js", []):
-                self.assertTrue(os.path.isfile(path(name)), name)
+    def test_content_script_entry(self):
+        # content.js asks the service worker for hiding CSS in every page and frame.
+        scripts = self.manifest.get("content_scripts")
+        self.assertIsInstance(scripts, list)
+        self.assertEqual(len(scripts), 1)
+        script = scripts[0]
+        self.assertEqual(script.get("matches"), ["<all_urls>"])
+        self.assertEqual(script.get("js"), ["content.js"])
+        self.assertEqual(script.get("run_at"), "document_start")
+        self.assertIs(script.get("all_frames"), True)
+        self.assertIs(script.get("match_about_blank"), True)
+        self.assertNotIn("css", script)
+        self.assertNotIn("world", script)  # must stay in the default isolated world
+        self.assertTrue(os.path.isfile(path("content.js")))
+        self.assertGreater(os.path.getsize(path("content.js")), 0)
 
     def test_popup_if_present(self):
         popup = self.manifest.get("action", {}).get("default_popup")

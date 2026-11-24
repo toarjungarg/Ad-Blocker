@@ -27,6 +27,7 @@ async function settle() {
 //   options.storage:     starting content of chrome.storage.local
 //   options.dynamic:     rules already saved from an earlier run
 //   options.importFails: make importScripts throw
+//   options.insertFails: make chrome.scripting.insertCSS throw
 function loadBackground(options) {
   options = options || {};
   const files = options.files || {};
@@ -37,7 +38,8 @@ function loadBackground(options) {
   const logs = { warn: [], log: [], error: [] };
   const calls = []; // every updateDynamicRules argument, in order
   const badges = []; // every setExtensionActionOptions argument
-  const listeners = { installed: [], startup: [], changed: [] };
+  const listeners = { installed: [], startup: [], changed: [], message: [] };
+  const inserted = []; // every chrome.scripting.insertCSS argument
 
   const dnr = {
     async setExtensionActionOptions(opts) { badges.push(JSON.parse(JSON.stringify(opts))); },
@@ -68,6 +70,13 @@ function loadBackground(options) {
       getURL: (p) => "chrome-extension://fakeid/" + p,
       onInstalled: { addListener: (fn) => listeners.installed.push(fn) },
       onStartup: { addListener: (fn) => listeners.startup.push(fn) },
+      onMessage: { addListener: (fn) => listeners.message.push(fn) },
+    },
+    scripting: {
+      async insertCSS(details) {
+        if (options.insertFails) throw new Error("No tab with id");
+        inserted.push(JSON.parse(JSON.stringify(details)));
+      },
     },
     storage: {
       local: {
@@ -117,7 +126,14 @@ function loadBackground(options) {
   }
 
   return {
-    sandbox, chrome, logs, calls, badges, listeners, storage, dynamicRules, loadError,
+    sandbox, chrome, logs, calls, badges, listeners, storage, dynamicRules, loadError, inserted,
+    // Sends a message like content.js would, and returns what the listener returned.
+    send: async (message, sender) => {
+      let returned;
+      for (const fn of listeners.message) returned = fn(message, sender);
+      await settle();
+      return returned;
+    },
     constant: (name) => vm.runInContext(name, sandbox),
     install: async () => { for (const fn of listeners.installed) fn({ reason: "install" }); await settle(); },
     startup: async () => { for (const fn of listeners.startup) fn(); await settle(); },
@@ -467,4 +483,183 @@ test("a broken update does not stop the next one (the queue keeps going)", async
   bg.chrome.declarativeNetRequest.updateDynamicRules = original;
   await bg.changeStorage("allowlist", ["b.com"]);
   assert.deepStrictEqual(bg.dynamicRules.get(ALLOWLIST_ID).condition.requestDomains, ["b.com"]);
+});
+
+// ------------------------------------------------------------- hiding (CSS)
+
+const HIDE_FILES = {
+  "base-hide.json": JSON.stringify({ generic: [".base-ad", ".shared"] }),
+  "rules/hide.json": JSON.stringify({
+    // "div:bogus-pseudo" is invalid but balanced, so it stays (the browser ignores
+    // just that line). "div[bad" has an unclosed bracket, so the worker drops it.
+    generic: [".shared", ".gen-one", "div:bogus-pseudo", "div[bad"],
+    sites: { "example.com": [".only-example", ".gen-one"], "sub.example.com": [".only-sub"] },
+    siteExceptions: { "example.com": [".gen-one"] },
+  }),
+};
+
+// A message sender like Chrome gives for a top page (frameId 0).
+function topSender(url, tabId) {
+  return { tab: { id: tabId || 7, url }, frameId: 0, url };
+}
+
+// Splits CSS from the worker back into its selectors (one rule per line).
+function selectorsOf(bg, css) {
+  const hide = bg.constant("HIDE_CSS");
+  return css.split("\n").map((rule) => rule.slice(0, rule.length - hide.length));
+}
+
+test("the worker registers a message listener and replies with nothing", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  assert.strictEqual(bg.loadError, null);
+  assert.strictEqual(bg.listeners.message.length, 1);
+  const returned = await bg.send({ type: "hide" }, topSender("https://other.org/"));
+  assert.ok(returned === undefined || returned === false);
+});
+
+test("hide: a normal page gets generic CSS, one rule per selector, in the USER origin", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, topSender("https://www.other.org/page", 9));
+  assert.strictEqual(bg.inserted.length, 1);
+  const call = bg.inserted[0];
+  assert.deepStrictEqual(call.target, { tabId: 9, frameIds: [0] });
+  assert.strictEqual(call.origin, "USER");
+  // base selectors first, duplicates removed, the invalid-but-balanced selector kept
+  // as its own rule, the unbalanced "div[bad" dropped
+  assert.deepStrictEqual(selectorsOf(bg, call.css), [".base-ad", ".shared", ".gen-one", "div:bogus-pseudo"]);
+  assert.ok(call.css.endsWith(bg.constant("HIDE_CSS")));
+});
+
+test("hide: site selectors come from the host and its parents, and exceptions are removed", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, topSender("https://sub.example.com/"));
+  assert.deepStrictEqual(
+    selectorsOf(bg, bg.inserted[0].css),
+    [".base-ad", ".shared", "div:bogus-pseudo", ".only-sub", ".only-example"]
+  );
+});
+
+test("hide: a page does not get another site's selectors", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, topSender("https://notexample.com/"));
+  assert.ok(!bg.inserted[0].css.includes(".only-example"));
+  assert.ok(bg.inserted[0].css.includes(".gen-one"));
+});
+
+test("hide: with no hide files at all nothing is injected and nothing is logged", async () => {
+  const bg = loadBackground();
+  await bg.send({ type: "hide" }, topSender("https://example.com/"));
+  assert.strictEqual(bg.inserted.length, 0);
+  assert.deepStrictEqual(bg.logs.warn, []);
+});
+
+test("hide: without rules/hide.json the base-hide.json selectors are still used", async () => {
+  const bg = loadBackground({ files: { "base-hide.json": HIDE_FILES["base-hide.json"] } });
+  await bg.send({ type: "hide" }, topSender("https://example.com/"));
+  assert.deepStrictEqual(selectorsOf(bg, bg.inserted[0].css), [".base-ad", ".shared"]);
+});
+
+test("hide: a broken rules/hide.json is treated as empty", async () => {
+  const bg = loadBackground({
+    files: { "rules/hide.json": "{not json", "base-hide.json": HIDE_FILES["base-hide.json"] },
+  });
+  await bg.send({ type: "hide" }, topSender("https://example.com/"));
+  assert.deepStrictEqual(selectorsOf(bg, bg.inserted[0].css), [".base-ad", ".shared"]);
+});
+
+test("hide: selectors that could break out of their rule are dropped", async () => {
+  const files = { "rules/hide.json": JSON.stringify({ generic: [".ok", "a}body{display:none", "x\ny", 5, ""] }) };
+  const bg = loadBackground({ files });
+  await bg.send({ type: "hide" }, topSender("https://example.com/"));
+  assert.deepStrictEqual(selectorsOf(bg, bg.inserted[0].css), [".ok"]);
+});
+
+test("hide: a host named like a built-in property does not break anything", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, topSender("http://constructor/"));
+  assert.strictEqual(bg.inserted.length, 1);
+  assert.ok(!bg.inserted[0].css.includes("function"));
+});
+
+test("hide: allowlisted sites and their subdomains get nothing", async () => {
+  const bg = loadBackground({ files: HIDE_FILES, storage: { allowlist: ["example.com"] } });
+  await bg.send({ type: "hide" }, topSender("https://www.example.com/"));
+  await bg.send({ type: "hide" }, topSender("https://news.example.com/"));
+  assert.strictEqual(bg.inserted.length, 0);
+});
+
+test("hide: the allowlist is read every time, so a change applies at once", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, topSender("https://other.org/"));
+  bg.storage.allowlist = ["other.org"];
+  await bg.send({ type: "hide" }, topSender("https://other.org/"));
+  assert.strictEqual(bg.inserted.length, 1);
+});
+
+test("hide: pages that are not http or https get nothing", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  const urls = ["chrome://extensions/", "file:///tmp/x.html", "about:blank", "chrome-extension://abc/p.html", undefined];
+  for (const url of urls) await bg.send({ type: "hide" }, topSender(url));
+  assert.strictEqual(bg.inserted.length, 0);
+});
+
+test("hide: a frame uses its own host for site selectors, or the page's if it has none", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "hide" }, { tab: { id: 3, url: "https://other.org/" }, frameId: 5, url: "https://example.com/frame" });
+  assert.deepStrictEqual(bg.inserted[0].target, { tabId: 3, frameIds: [5] });
+  assert.ok(bg.inserted[0].css.includes(".only-example"));
+  await bg.send({ type: "hide" }, { tab: { id: 3, url: "https://sub.example.com/" }, frameId: 6, url: "about:blank" });
+  assert.ok(bg.inserted[1].css.includes(".only-sub"));
+});
+
+test("hide: a frame inside an allowlisted page gets nothing", async () => {
+  const bg = loadBackground({ files: HIDE_FILES, storage: { allowlist: ["other.org"] } });
+  await bg.send({ type: "hide" }, { tab: { id: 3, url: "https://other.org/" }, frameId: 5, url: "https://ads.example.net/" });
+  assert.strictEqual(bg.inserted.length, 0);
+});
+
+test("hide: other message types and bad senders are ignored", async () => {
+  const bg = loadBackground({ files: HIDE_FILES });
+  await bg.send({ type: "something-else" }, topSender("https://other.org/"));
+  await bg.send(undefined, topSender("https://other.org/"));
+  await bg.send({ type: "hide" }, undefined);
+  await bg.send({ type: "hide" }, { frameId: 0, url: "https://other.org/" }); // no tab
+  assert.strictEqual(bg.inserted.length, 0);
+  assert.deepStrictEqual(bg.logs.warn, []);
+});
+
+test("hide: an insertCSS error (closed tab) is ignored", async () => {
+  const bg = loadBackground({ files: HIDE_FILES, insertFails: true });
+  await bg.send({ type: "hide" }, topSender("https://other.org/"));
+  assert.deepStrictEqual(bg.logs.warn, []);
+});
+
+test("hide: the files are read once per worker life", async () => {
+  let reads = 0;
+  const bg = loadBackground({ files: HIDE_FILES });
+  const realFetch = bg.sandbox.fetch;
+  bg.sandbox.fetch = async (url) => { reads++; return realFetch(url); };
+  await bg.send({ type: "hide" }, topSender("https://a.org/"));
+  await bg.send({ type: "hide" }, topSender("https://b.org/"));
+  assert.strictEqual(reads, 2); // base-hide.json and rules/hide.json, once each
+  assert.strictEqual(bg.inserted[0].css, bg.inserted[1].css);
+});
+
+test("hide: the per-host CSS cache never grows past MAX_CSS_CACHE and drops the oldest first", async () => {
+  const hostCount = 230; // more than MAX_CSS_CACHE (checked below)
+  const exceptions = {};
+  for (let i = 0; i < hostCount; i++) exceptions["site" + i + ".com"] = [".gen-one"];
+  const files = {
+    "rules/hide.json": JSON.stringify({ generic: [".gen-one", ".keep"], sites: {}, siteExceptions: exceptions }),
+  };
+  const busy = loadBackground({ files });
+  const max = busy.constant("MAX_CSS_CACHE");
+  for (let i = 0; i < hostCount; i++) {
+    await busy.send({ type: "hide" }, topSender("https://site" + i + ".com/"));
+  }
+  assert.ok(hostCount > max);
+  assert.strictEqual(busy.constant("filteredCssCache.size"), max);
+  assert.strictEqual(busy.constant("filteredCssCache.has('site0.com')"), false);
+  assert.strictEqual(busy.constant("filteredCssCache.has('site" + (hostCount - 1) + ".com')"), true);
+  assert.deepStrictEqual(selectorsOf(busy, busy.inserted[0].css), [".keep"]);
 });
