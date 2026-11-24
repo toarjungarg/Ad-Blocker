@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<!--
+  test-page/index.html
+
+  A local page full of fake ads, for testing the extension by hand.
+
+  How to use it:
+    1. In a terminal, from the repo root:   python3 -m http.server 8000
+    2. Open http://localhost:8000/test-page/ in Chrome.
+       (Content scripts do not run on file:// pages, so use the local server.)
+    3. Look at the page with the extension on, then turn it off and reload.
+
+  test.js makes the table of ad servers. This file holds the fake ad boxes.
+  Every fake ad box uses one of the selectors in base-hide.json, and its label
+  says which one. The only outside requests are the ones to the ad servers.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Ad-Blocker test page</title>
+  <link rel="stylesheet" href="test.css">
+</head>
+<body>
+  <h1>Ad-Blocker test page</h1>
+
+  <section class="note">
+    <h2>What you should see</h2>
+    <ul>
+      <li><strong>Extension on:</strong> every row in the first table says
+        <span class="blocked">blocked</span>, every fake ad box is gone
+        (every row in the second table says <span class="blocked">hidden</span>),
+        and the real content box is still there.</li>
+      <li><strong>Extension off:</strong> the rows say
+        <span class="loaded">loaded</span>, and all the fake ad boxes show up.</li>
+      <li>You need an internet connection. With no connection, every request
+        fails and looks like it was blocked.</li>
+      <li>After you turn the extension on or off in chrome://extensions, reload this page.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>1. Network blocking</h2>
+    <p>One request is sent to each server in base-rules.json. The list is read
+      from that file, so this table always matches it.</p>
+    <p id="request-summary" class="summary">Waiting for requests...</p>
+    <table id="request-table">
+      <thead>
+        <tr><th>Server</th><th>Result</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. Hiding</h2>
+    <p>Each box below should disappear. The label says which selector from
+      base-hide.json it tests.</p>
+
+    <!-- Fake ads. data-selector holds the selector the box is meant to match;
+         test.js checks that it really matches and reports if the box is hidden. -->
+    <div class="fake-ads">
+      <div id="google_ads_iframe_test" class="fake-ad" data-selector='div[id^="google_ads_iframe"]'>
+        Fake ad: div[id^="google_ads_iframe"]
+      </div>
+      <div id="div-gpt-ad-1234" class="fake-ad" data-selector='div[id^="div-gpt-ad"]'>
+        Fake ad: div[id^="div-gpt-ad"]
+      </div>
+      <ins class="adsbygoogle fake-ad" data-selector="ins.adsbygoogle">
+        Fake ad: ins.adsbygoogle
+      </ins>
+      <iframe id="google_ads_iframe_frame" class="fake-ad-frame" title="fake ad frame"
+              data-selector='iframe[id^="google_ads_iframe"]'></iframe>
+      <iframe src="https://doubleclick.net/test-frame.html" class="fake-ad-frame" title="fake ad frame"
+              data-selector='iframe[src*="doubleclick.net"]'></iframe>
+      <iframe src="https://googlesyndication.com/test-frame.html" class="fake-ad-frame" title="fake ad frame"
+              data-selector='iframe[src*="googlesyndication.com"]'></iframe>
+      <iframe src="https://amazon-adsystem.com/test-frame.html" class="fake-ad-frame" title="fake ad frame"
+              data-selector='iframe[src*="amazon-adsystem.com"]'></iframe>
+      <a href="https://doubleclick.net/click" class="fake-ad" data-selector='a[href*="doubleclick.net/"]'>
+        Fake ad link: a[href*="doubleclick.net/"]
+      </a>
+      <a href="https://googleadservices.com/click" class="fake-ad" data-selector='a[href*="googleadservices.com/"]'>
+        Fake ad link: a[href*="googleadservices.com/"]
+      </a>
+      <div id="taboola-below-article" class="fake-ad" data-selector='[id^="taboola-"]'>
+        Fake ad: [id^="taboola-"]
+      </div>
+      <div id="outbrain_widget_0" class="fake-ad" data-selector='[id^="outbrain_widget"]'>
+        Fake ad: [id^="outbrain_widget"]
+      </div>
+      <div class="OUTBRAIN fake-ad" data-selector=".OUTBRAIN">
+        Fake ad: .OUTBRAIN
+      </div>
+      <div class="trc_related_container fake-ad" data-selector=".trc_related_container">
+        Fake ad: .trc_related_container
+      </div>
+      <div class="ad-banner fake-ad" data-selector=".ad-banner">
+        Fake ad: .ad-banner
+      </div>
+      <div class="ad-container fake-ad" data-selector=".ad-container">
+        Fake ad: .ad-container
+      </div>
+      <div class="ad-wrapper fake-ad" data-selector=".ad-wrapper">
+        Fake ad: .ad-wrapper
+      </div>
+      <div class="adsbox fake-ad" data-selector=".adsbox">
+        Fake ad: .adsbox
+      </div>
+      <div class="advertisement fake-ad" data-selector=".advertisement">
+        Fake ad: .advertisement
+      </div>
+      <div class="sponsored-ad fake-ad" data-selector=".sponsored-ad">
+        Fake ad: .sponsored-ad
+      </div>
+      <div class="banner-ads fake-ad" data-selector=".banner-ads">
+        Fake ad: .banner-ads
+      </div>
+      <div id="ad-slot" class="fake-ad" data-selector="#ad-slot">
+        Fake ad: #ad-slot
+      </div>
+      <div id="ad-banner" class="fake-ad" data-selector="#ad-banner">
+        Fake ad: #ad-banner
+      </div>
+      <div id="advertisement" class="fake-ad" data-selector="#advertisement">
+        Fake ad: #advertisement
+      </div>
+    </div>
+
+    <!-- The one box that must NOT be hidden. Its names do not match any selector. -->
+    <div class="real-content" id="real-content" data-real="true">
+      Real content: this box must stay visible.
+    </div>
+
+    <p id="hide-summary" class="summary">Checking...</p>
+    <p id="hide-warnings" class="warning"></p>
+    <button type="button" id="recheck-button">Check again</button>
+    <table id="hide-table">
+      <thead>
+        <tr><th>Selector</th><th>Result</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <script src="test.js"></script>
+</body>
+</html>
