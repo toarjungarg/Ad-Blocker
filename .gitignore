@@ -8,3 +8,4 @@ node_modules/
 rules/
 lists/
 __pycache__/
+_metadata/

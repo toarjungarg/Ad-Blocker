@@ -37,6 +37,13 @@
 
   <p id="blocked-line" class="line">Blocked on this page: 0</p>
 
+  <!-- The dropdown. <details> opens and closes by itself when the <summary> line
+       is clicked, so it needs no script. popup.js fills the list inside it. -->
+  <details id="blocked-details" class="blocked-details">
+    <summary id="blocked-summary">Show what was blocked</summary>
+    <div id="blocked-list" class="blocked-list"></div>
+  </details>
+
   <p id="rules-line" class="line">Rules from ...</p>
   <p id="rules-hint" class="hint"></p>
 

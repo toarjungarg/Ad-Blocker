@@ -17,6 +17,8 @@
 //      with "display:none" rules into that page, unless the site is on the
 //      allowlist. The selectors come from rules/hide.json (made by
 //      tools/convert.py) plus the small built-in list in base-hide.json.
+//   5. Keeps a list of what was blocked on each tab, for the popup's dropdown
+//      (see "blocked list" below).
 //
 // Why dynamic rules for the converted lists? A rule file named in manifest.json
 // must exist or Chrome will not load the extension, and rules/ is not in the
@@ -54,6 +56,15 @@ const HIDE_CSS = "{display:none!important}"; // what each hidden element gets
 const MAX_CSS_CACHE = 200;                    // most hostnames whose CSS we remember
 const HIDE_RULES_PATH = "rules/hide.json";    // made by tools/convert.py (may be missing)
 const BASE_HIDE_PATH = "base-hide.json";      // small built-in list, always used
+
+// Settings for the popup's "what was blocked" list.
+// Each tab's list is saved in chrome.storage.session under "blocked:<tab id>".
+// Session storage lives in memory only and is wiped when Chrome closes, so the
+// list of blocked addresses is never written to disk. popup.js has the same
+// prefix (BLOCKED_KEY_PREFIX), so change both together.
+const BLOCKED_KEY_PREFIX = "blocked:";
+const MAX_BLOCKED_ENTRIES = 200;            // most different addresses kept per tab
+const META_RULES_PATH = "rules/meta.json";  // tells us how many converted rules are blocks
 
 // ------------------------------------------------------------- load helpers
 
@@ -463,6 +474,70 @@ async function handleHideMessage(sender) {
   }
 }
 
+// ------------------------------------------------------------- blocked list
+
+// Chrome's onRuleMatchedDebug event tells us the real address of every request a
+// rule matched. It only exists for extensions loaded unpacked (from a folder);
+// a store install never gets it, and then the popup list simply stays empty.
+//
+// The event fires for every matched rule, allow rules too, so we keep only the
+// block rules. Which converted rules are blocks depends on rules/meta.json, so
+// that number is read once per worker life and reused.
+let blockRuleCountPromise = null;
+
+function getBlockRuleCount() {
+  if (!blockRuleCountPromise) {
+    blockRuleCountPromise = readExtensionJson(META_RULES_PATH).then((meta) =>
+      isPlainObject(meta) && typeof meta.blockRules === "number" ? meta.blockRules : 0
+    );
+  }
+  return blockRuleCountPromise;
+}
+
+// Saving is "read the list, change it, write it back". If two blocks arrived at
+// the same moment, both could read the old list and one change would be lost.
+// So, like the rule queue above, every change to the lists runs one at a time.
+// It is a separate queue so the list never waits for the big rule load.
+let blockedWork = Promise.resolve();
+
+function queueBlockedWork(task) {
+  const result = blockedWork.then(task);
+  blockedWork = result.catch(() => {});
+  return result;
+}
+
+// Adds one blocked request to its tab's list. The same address and type just
+// gets its count raised, so a tracker that fires 20 times is one line, not 20.
+async function recordBlocked(info) {
+  const request = info && info.request;
+  if (!request || typeof request.tabId !== "number" || request.tabId < 0) return; // not from a tab
+  if (!isBlockRule(info.rule, await getBlockRuleCount())) return;
+  const address = shortAddress(request.url);
+  if (!address) return;
+  const type = typeof request.type === "string" ? request.type : "other";
+
+  const key = BLOCKED_KEY_PREFIX + request.tabId;
+  const data = await chrome.storage.session.get(key);
+  const list = Array.isArray(data[key]) ? data[key] : [];
+  const same = list.find(
+    (entry) => entry.host === address.host && entry.path === address.path && entry.type === type
+  );
+  if (same) {
+    same.count++;
+  } else if (list.length < MAX_BLOCKED_ENTRIES) {
+    list.push({ host: address.host, path: address.path, type, count: 1 });
+  } else {
+    return; // list is full; the count in the popup still includes it
+  }
+  await chrome.storage.session.set({ [key]: list });
+}
+
+// Empties a tab's list (a new page started loading, or the tab was closed).
+async function clearBlocked(tabId) {
+  if (typeof tabId !== "number") return;
+  await chrome.storage.session.remove(BLOCKED_KEY_PREFIX + tabId);
+}
+
 // ------------------------------------------------------------- events
 
 // Everything here is wrapped in try/catch so the worker never throws while it
@@ -503,4 +578,32 @@ try {
   });
 } catch (e) {
   console.warn("Ad-Blocker: could not start", e);
+}
+
+// The blocked list's events are in their own block, so a missing event (like
+// onRuleMatchedDebug in a store install) cannot stop the listeners above.
+try {
+  const dnr = chrome.declarativeNetRequest;
+  if (dnr && dnr.onRuleMatchedDebug) {
+    dnr.onRuleMatchedDebug.addListener((info) => {
+      queueBlockedWork(() => recordBlocked(info)).catch(() => {}); // a closed tab is fine
+    });
+  }
+
+  // "loading" means a new page (or a reload) started in that tab, so the old
+  // list no longer belongs to what is on screen.
+  if (chrome.tabs && chrome.tabs.onUpdated) {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+      if (changeInfo && changeInfo.status === "loading") {
+        queueBlockedWork(() => clearBlocked(tabId)).catch(() => {});
+      }
+    });
+  }
+  if (chrome.tabs && chrome.tabs.onRemoved) {
+    chrome.tabs.onRemoved.addListener((tabId) => {
+      queueBlockedWork(() => clearBlocked(tabId)).catch(() => {});
+    });
+  }
+} catch (e) {
+  console.warn("Ad-Blocker: could not start the blocked list", e);
 }

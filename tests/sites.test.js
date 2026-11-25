@@ -10,9 +10,10 @@ const path = require("node:path");
 const sites = require(path.join(__dirname, "..", "lib", "sites.js"));
 const { siteFromUrl, isAllowlisted, parentDomains, ruleAgeDays, isRulesStale, countBlocked } = sites;
 
-test("lib/sites.js exports exactly the six helper functions", () => {
+test("lib/sites.js exports exactly the eight helper functions", () => {
   assert.deepStrictEqual(Object.keys(sites).sort(), [
-    "countBlocked", "isAllowlisted", "isRulesStale", "parentDomains", "ruleAgeDays", "siteFromUrl",
+    "countBlocked", "isAllowlisted", "isBlockRule", "isRulesStale", "parentDomains", "ruleAgeDays",
+    "shortAddress", "siteFromUrl",
   ]);
   for (const name of Object.keys(sites)) assert.strictEqual(typeof sites[name], "function");
 });

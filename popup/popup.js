@@ -3,7 +3,8 @@
 // The code behind the toolbar popup (popup.html). When you click the icon it:
 //   1. finds the tab you are on and works out its site name,
 //   2. shows a switch: on = ads are blocked on this site, off = the site is on the allowlist,
-//   3. shows how many requests were blocked on this page,
+//   3. shows how many requests were blocked on this page, with a dropdown that
+//      lists what they were (saved by background.js),
 //   4. shows when the filter rules were built, in orange if they are old.
 //
 // The helper functions (siteFromUrl, isAllowlisted, isRulesStale, countBlocked) come
@@ -96,6 +97,56 @@ const NOT_WEB_NOTE = "This page can't be blocked or allowed";
 const SAVE_FAILED_NOTE = "Could not save. Please try again.";
 const RELOAD_FAILED_NOTE = "Saved. Reload the page to see the change.";
 
+// ------------------------------------------------- the "what was blocked" list
+
+// background.js saves each tab's list in chrome.storage.session under this
+// prefix plus the tab id. background.js has the same prefix, so change both.
+const BLOCKED_KEY_PREFIX = "blocked:";
+
+// The dropdown's clickable line, closed and open.
+const SUMMARY_SHOW = "Show what was blocked";
+const SUMMARY_HIDE = "Hide what was blocked";
+
+// What the open dropdown says when it has nothing to show.
+const EMPTY_LIST_NOTE = "Nothing listed yet. Reload the page to fill this list.";
+const NO_DEBUG_NOTE = "This list only works when the extension is loaded unpacked.";
+
+// Chrome's names for request types, in plainer words. Types not listed here
+// (script, image, font, media...) are already plain and are shown as they are.
+const TYPE_LABELS = {
+  xmlhttprequest: "data",
+  sub_frame: "frame",
+  main_frame: "page",
+  csp_report: "report",
+};
+
+function typeLabel(type) {
+  if (typeof type !== "string" || type === "") return "other";
+  return Object.prototype.hasOwnProperty.call(TYPE_LABELS, type) ? TYPE_LABELS[type] : type;
+}
+
+// Groups the saved entries by site for the dropdown.
+//   in:  [{ host, path, type, count }, ...]   (what background.js saves)
+//   out: [{ host, total, items: [{ path, type, count }] }, ...]
+// Sites with the most blocks come first, and inside a site so do its busiest
+// addresses. Broken entries are skipped, so a bad save cannot break the popup.
+function groupBlocked(entries) {
+  const byHost = new Map();
+  if (!Array.isArray(entries)) return [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.host !== "string" || typeof entry.path !== "string") continue;
+    const count = Number.isInteger(entry.count) && entry.count > 0 ? entry.count : 1;
+    if (!byHost.has(entry.host)) byHost.set(entry.host, { host: entry.host, total: 0, items: [] });
+    const group = byHost.get(entry.host);
+    group.total += count;
+    group.items.push({ path: entry.path, type: typeLabel(entry.type), count: count });
+  }
+  const groups = Array.from(byHost.values());
+  for (const group of groups) group.items.sort((a, b) => b.count - a.count);
+  groups.sort((a, b) => b.total - a.total || a.host.localeCompare(b.host));
+  return groups;
+}
+
 // ------------------------------------------------------- the Chrome part
 
 // Reads the rules date file. Returns the parsed object, or null if it is missing or broken.
@@ -143,6 +194,55 @@ function showRules(meta) {
   document.getElementById("rules-hint").textContent = info.hint;
 }
 
+// Makes one element with plain text in it. textContent (never innerHTML) is used
+// on purpose: the addresses come from websites, and innerHTML would run any HTML
+// hidden in them inside the popup.
+function makeTextElement(tag, className, text) {
+  const element = document.createElement(tag);
+  element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+// Fills the dropdown with this tab's blocked list. Any problem just leaves the
+// dropdown with a short note, because the rest of the popup must keep working.
+async function showBlockedList(tabId) {
+  const details = document.getElementById("blocked-details");
+  const summary = document.getElementById("blocked-summary");
+  const box = document.getElementById("blocked-list");
+
+  // Switch the clickable line between "Show" and "Hide" as it opens and closes.
+  details.addEventListener("toggle", function () {
+    summary.textContent = details.open ? SUMMARY_HIDE : SUMMARY_SHOW;
+  });
+
+  let groups = [];
+  try {
+    const key = BLOCKED_KEY_PREFIX + tabId;
+    const data = await chrome.storage.session.get(key);
+    groups = groupBlocked(data[key]);
+  } catch (e) {
+    groups = [];
+  }
+
+  box.textContent = ""; // clear anything left over
+  if (groups.length === 0) {
+    const debugAvailable = Boolean(chrome.declarativeNetRequest.onRuleMatchedDebug);
+    box.appendChild(makeTextElement("p", "blocked-empty", debugAvailable ? EMPTY_LIST_NOTE : NO_DEBUG_NOTE));
+    return;
+  }
+  for (const group of groups) {
+    box.appendChild(makeTextElement("div", "blocked-host", group.host + " (" + group.total + ")"));
+    for (const item of group.items) {
+      const row = document.createElement("div");
+      row.className = "blocked-item";
+      row.appendChild(makeTextElement("span", "blocked-path", item.path + " (" + item.type + ")"));
+      row.appendChild(makeTextElement("span", "blocked-count", "x" + item.count));
+      box.appendChild(row);
+    }
+  }
+}
+
 // Runs when the popup opens.
 async function start() {
   const switchBox = document.getElementById("block-switch");
@@ -163,6 +263,11 @@ async function start() {
     switchBox.disabled = true;
     showNote(NOT_WEB_NOTE);
     document.getElementById("blocked-line").textContent = blockedText(0);
+    try {
+      document.getElementById("blocked-details").hidden = true; // nothing can be blocked here
+    } catch (e) {
+      // ignored: the dropdown is extra, the lines above are what matter
+    }
     return;
   }
 
@@ -174,6 +279,12 @@ async function start() {
 
   const count = await loadBlockedCount(tab.id, meta ? meta.blockRules : 0);
   document.getElementById("blocked-line").textContent = blockedText(count);
+
+  try {
+    await showBlockedList(tab.id);
+  } catch (e) {
+    // ignored: a broken list must never stop the switch below from working
+  }
 
   // When the switch is flipped: save the new allowlist, then reload the tab so the
   // change shows. The switch stays disabled while we save so it cannot be clicked twice.
@@ -218,5 +329,7 @@ if (typeof module !== "undefined" && module.exports) {
     describeRules,
     nextAllowlist,
     blockedText,
+    groupBlocked,
+    typeLabel,
   };
 }
